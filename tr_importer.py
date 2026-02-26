@@ -1,216 +1,310 @@
 """
 Investment Watcher — Trade Republic Importer
-Parses Trade Republic PDF portfolio statements and trade confirmations.
+Parses Trade Republic PDF portfolio statements (French format).
 Also supports manual CSV upload.
 
-TR Portfolio Statement typically contains:
-- Asset name + ISIN
-- Number of shares
-- Current price + value
-- Average cost / purchase price
-- P&L
+TR French Statement Format:
+--------------------------
+Each position block looks like:
 
-TR Trade Confirmation contains:
-- Buy/Sell action
-- Asset name + ISIN
-- Shares + price
-- Fees
-- Date
+  0,285659 titre(s)    Alphabet Inc.
+                        Reg. Shs Cap.Stk Cl. A DL-,001
+                        ISIN : US02079K3059
+                        Pays d'enregistrement: États-Unis
+                        264,45              <-- price per share
+                        26/02/2026          <-- date
+                        75,54               <-- total value EUR
+
+Multiple accounts may appear (CTO, PEA) with headers like:
+  COMPTE-TITRES ORDINAIRE
+  PLAN D'ÉPARGNE EN ACTIONS
 """
 
 import re
 import io
 from typing import Optional
 
-# ISIN pattern: 2 letters + 10 alphanumeric
-ISIN_PATTERN = re.compile(r"\b([A-Z]{2}[A-Z0-9]{10})\b")
 
-# Common ISIN to Yahoo ticker mapping for popular stocks
+# ISIN pattern
+ISIN_PATTERN = re.compile(r"ISIN\s*:\s*([A-Z]{2}[A-Z0-9]{10})")
+
+# Account type detection
+ACCOUNT_PATTERNS = {
+    "CTO": re.compile(r"COMPTE-TITRES\s+ORDINAIRE", re.IGNORECASE),
+    "PEA": re.compile(r"PLAN\s+D['\u2019]?\s*EPARGNE|PLAN\s+D['\u2019]?\s*\u00C9PARGNE", re.IGNORECASE),
+}
+
+# ISIN to Yahoo Finance ticker mapping
 ISIN_TICKER_MAP = {
-    # US stocks
-    "US0378331005": ("AAPL", "Apple Inc.", "US"),
-    "US5949181045": ("MSFT", "Microsoft Corp.", "US"),
-    "US0231351067": ("AMZN", "Amazon.com Inc.", "US"),
-    "US02079K3059": ("GOOGL", "Alphabet Inc.", "US"),
-    "US30303M1027": ("META", "Meta Platforms Inc.", "US"),
-    "US88160R1014": ("TSLA", "Tesla Inc.", "US"),
-    "US67066G1040": ("NVDA", "NVIDIA Corp.", "US"),
-    "US4781601046": ("JNJ", "Johnson & Johnson", "US"),
-    "US92826C8394": ("V", "Visa Inc.", "US"),
-    "US46625H1005": ("JPM", "JPMorgan Chase", "US"),
-    "US0846707026": ("BRK-B", "Berkshire Hathaway B", "US"),
-    "US7427181091": ("PG", "Procter & Gamble", "US"),
-    "US4592001014": ("IBM", "IBM Corp.", "US"),
-    "US2546871060": ("DIS", "Walt Disney", "US"),
-    "US00507V1098": ("ATVI", "Activision Blizzard", "US"),
-    "US0079031078": ("AMD", "Advanced Micro Devices", "US"),
-    "US7170811035": ("PFE", "Pfizer Inc.", "US"),
-    "US2855121099": ("LRCX", "Lam Research", "US"),
-    "US8740391003": ("TSM", "Taiwan Semiconductor", "US"),
-    # European stocks
-    "NL0010273215": ("ASML.AS", "ASML Holding", "Amsterdam"),
-    "FR0000121014": ("MC.PA", "LVMH", "Paris"),
-    "FR0000120271": ("TTE.PA", "TotalEnergies", "Paris"),
-    "DE0007164600": ("SAP.DE", "SAP SE", "Frankfurt"),
-    "DE0007236101": ("SIE.DE", "Siemens AG", "Frankfurt"),
-    "FR0000120578": ("SAN.PA", "Sanofi", "Paris"),
-    "NL0000235190": ("AIR.PA", "Airbus SE", "Paris"),
-    "FR0000131104": ("BNP.PA", "BNP Paribas", "Paris"),
-    "FR0000120321": ("OR.PA", "L'Oreal", "Paris"),
-    "FR0000125338": ("CAP.PA", "Capgemini", "Paris"),
-    "FR0000121972": ("SCR.PA", "Schneider Electric", "Paris"),
-    "IE00B4BNMY34": ("ACWI", "iShares MSCI ACWI ETF", "US"),
-    # Popular ETFs
-    "IE00B5BMR087": ("CSPX.L", "iShares Core S&P 500", "London"),
-    "IE00B4L5Y983": ("IWDA.AS", "iShares Core MSCI World", "Amsterdam"),
-    "LU0392494562": ("MEUD.PA", "Lyxor Euro Stoxx 50", "Paris"),
-    "IE00BKM4GZ66": ("EIMI.L", "iShares Core EM IMI", "London"),
+    # --- US Stocks ---
+    "US0378331005": ("AAPL", "Apple Inc.", "US", "Technology"),
+    "US5949181045": ("MSFT", "Microsoft Corp.", "US", "Technology"),
+    "US0231351067": ("AMZN", "Amazon.com Inc.", "US", "Technology"),
+    "US02079K3059": ("GOOGL", "Alphabet Inc.", "US", "Technology"),
+    "US30303M1027": ("META", "Meta Platforms Inc.", "US", "Technology"),
+    "US88160R1014": ("TSLA", "Tesla Inc.", "US", "Technology"),
+    "US67066G1040": ("NVDA", "NVIDIA Corp.", "US", "Technology"),
+    "US4781601046": ("JNJ", "Johnson & Johnson", "US", "Healthcare"),
+    "US92826C8394": ("V", "Visa Inc.", "US", "Finance"),
+    "US46625H1005": ("JPM", "JPMorgan Chase", "US", "Finance"),
+    "US0846707026": ("BRK-B", "Berkshire Hathaway B", "US", "Finance"),
+    "US7427181091": ("PG", "Procter & Gamble", "US", "Consumer"),
+    "US4592001014": ("IBM", "IBM Corp.", "US", "Technology"),
+    "US2546871060": ("DIS", "Walt Disney", "US", "Consumer"),
+    "US0079031078": ("AMD", "Advanced Micro Devices", "US", "Technology"),
+    "US7170811035": ("PFE", "Pfizer Inc.", "US", "Healthcare"),
+    "US8740391003": ("TSM", "Taiwan Semiconductor", "US", "Technology"),
+    "US68389X1054": ("ORCL", "Oracle Corp.", "US", "Technology"),
+    "US5949724083": ("MSTR", "Strategy Inc.", "US", "Technology"),
+    # --- European Stocks ---
+    "NL0010273215": ("ASML.AS", "ASML Holding", "Amsterdam", "Technology"),
+    "FR0000121014": ("MC.PA", "LVMH", "Paris", "Consumer"),
+    "FR0000120271": ("TTE.PA", "TotalEnergies SE", "Paris", "Energy"),
+    "DE0007164600": ("SAP.DE", "SAP SE", "Frankfurt", "Technology"),
+    "DE0007236101": ("SIE.DE", "Siemens AG", "Frankfurt", "Industrial"),
+    "FR0000120578": ("SAN.PA", "Sanofi", "Paris", "Healthcare"),
+    "NL0000235190": ("AIR.PA", "Airbus SE", "Paris", "Industrial"),
+    "FR0000131104": ("BNP.PA", "BNP Paribas", "Paris", "Finance"),
+    "FR0000120321": ("OR.PA", "L'Oreal", "Paris", "Consumer"),
+    "FR0000125338": ("CAP.PA", "Capgemini", "Paris", "Technology"),
+    "FR0000121972": ("SE.PA", "Schneider Electric", "Paris", "Industrial"),
+    "NL0000226223": ("STM.PA", "STMicroelectronics N.V.", "Paris", "Technology"),
+    "FR001400X2S4": ("ATOS.PA", "Atos SE", "Paris", "Technology"),
+    "DE000A0DJ6J9": ("S92.DE", "SMA Solar Technology AG", "Frankfurt", "Energy"),
+    # --- ETFs ---
+    "IE00B3WJKG14": ("IUIT.L", "iShares S&P 500 Info Tech ETF", "London", "ETF-Technology"),
+    "IE00B4ND3602": ("IGLN.L", "iShares Physical Gold ETC", "London", "ETF-Commodities"),
+    "IE00BM67HM91": ("XDWE.DE", "Xtrackers MSCI World Energy ETF", "Frankfurt", "ETF-Energy"),
+    "IE000NXF88S1": ("OIH8.DE", "VanEck Oil Services UCITS ETF", "Frankfurt", "ETF-Energy"),
+    "IE00B5BMR087": ("CSPX.L", "iShares Core S&P 500", "London", "ETF-US"),
+    "IE00B4L5Y983": ("IWDA.AS", "iShares Core MSCI World", "Amsterdam", "ETF-Global"),
+    "LU0392494562": ("MEUD.PA", "Lyxor Euro Stoxx 50", "Paris", "ETF-Europe"),
+    "IE00BKM4GZ66": ("EIMI.L", "iShares Core EM IMI", "London", "ETF-EM"),
+    # --- ELTIF / Alternative ---
+    "LU3176111881": ("EQT-ELTIF", "EQT Nexus Fund ELTIF", "Luxembourg", "Alternative"),
+    # --- African ---
+    "ZAE000084992": ("EXX.JO", "Exxaro Resources Ltd.", "Johannesburg", "Energy"),
 }
 
 
 def parse_tr_portfolio_pdf(file_bytes: bytes) -> list[dict]:
     """
-    Parse Trade Republic portfolio statement PDF.
-    Returns list of position dicts.
+    Parse Trade Republic portfolio statement PDF (French format).
+    Returns list of position dicts with account info.
     """
     text = _extract_pdf_text(file_bytes)
     if not text:
         return []
 
     positions = []
-    lines = text.split("\n")
+    current_account = "CTO"
 
-    # Strategy: find ISINs, then extract surrounding context
-    for i, line in enumerate(lines):
-        isins = ISIN_PATTERN.findall(line)
-        for isin in isins:
-            position = _extract_position_from_context(lines, i, isin)
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Detect account type
+        for acct_type, pattern in ACCOUNT_PATTERNS.items():
+            if pattern.search(line):
+                current_account = acct_type
+
+        # Look for position start: "X,XXXX titre(s)"
+        shares_match = re.match(r"(\d+(?:[.,]\d+)?)\s*titre\(s\)\s*(.*)", line)
+        if shares_match:
+            shares_str = shares_match.group(1).replace(",", ".")
+            shares = float(shares_str)
+            remainder = shares_match.group(2).strip()
+
+            # Collect all lines of this position block until next position or section end
+            block_lines = [remainder] if remainder else []
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                # Stop at next position
+                if re.match(r"\d+(?:[.,]\d+)?\s*titre\(s\)", next_line):
+                    break
+                # Stop at section markers
+                if "NOMBRE DE POSITIONS" in next_line:
+                    break
+                if next_line.startswith("Veuillez noter"):
+                    break
+                if any(p.search(next_line) for p in ACCOUNT_PATTERNS.values()):
+                    break
+                # Stop at page headers
+                if "TRADE REPUBLIC BANK" in next_line:
+                    break
+                if next_line:
+                    block_lines.append(next_line)
+                j += 1
+
+            position = _parse_position_block(shares, block_lines, current_account)
             if position:
                 positions.append(position)
 
-    # Deduplicate by ISIN
-    seen = set()
-    unique = []
-    for p in positions:
-        if p["isin"] not in seen:
-            seen.add(p["isin"])
-            unique.append(p)
+            i = j
+            continue
 
-    return unique
+        i += 1
+
+    return positions
 
 
-def _extract_position_from_context(lines: list[str], isin_line_idx: int, isin: str) -> Optional[dict]:
-    """Extract position details from lines around where ISIN was found."""
-    # Get context: 5 lines before and after
-    start = max(0, isin_line_idx - 5)
-    end = min(len(lines), isin_line_idx + 6)
-    context = "\n".join(lines[start:end])
+def _parse_position_block(shares: float, lines: list[str], account: str) -> Optional[dict]:
+    """Parse a position block into a structured dict."""
+    if not lines:
+        return None
 
-    # Look up known ISIN
+    name = ""
+    description = ""
+    isin = ""
+    country = ""
+    numeric_values = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # ISIN
+        isin_match = ISIN_PATTERN.search(line)
+        if isin_match:
+            isin = isin_match.group(1)
+            continue
+
+        # Country
+        if "enregistrement" in line.lower():
+            country_match = re.search(r":\s*(.+)", line)
+            if country_match:
+                country = country_match.group(1).strip()
+            continue
+
+        # Skip "Relevé de transaction" lines
+        if "transaction" in line.lower() and "relev" in line.lower():
+            continue
+
+        # Date pattern (DD/MM/YYYY) — skip
+        if re.match(r"\d{2}/\d{2}/\d{4}$", line):
+            continue
+
+        # Pure number (price or value)
+        num = _parse_french_number(line)
+        if num is not None:
+            numeric_values.append(num)
+            continue
+
+        # Otherwise it's name or description text
+        if not name:
+            name = line
+        elif not description:
+            description = line
+
+    # Numeric values: [price_per_share, total_value_eur]
+    price = 0.0
+    value = 0.0
+    if len(numeric_values) >= 2:
+        price = numeric_values[0]
+        value = numeric_values[-1]
+    elif len(numeric_values) == 1:
+        price = numeric_values[0]
+        value = shares * price
+
+    # ISIN lookup
     known = ISIN_TICKER_MAP.get(isin)
-    ticker = known[0] if known else ""
-    name = known[1] if known else ""
-    market = known[2] if known else "US"
+    ticker = ""
+    market = "US"
+    sector = ""
 
-    # Try to extract name from context if not known
-    if not name:
-        # Usually the line before or same line as ISIN has the name
-        for j in range(max(0, isin_line_idx - 2), isin_line_idx + 1):
-            if j < len(lines):
-                candidate = lines[j].strip()
-                # Name is usually a line with text that's not just numbers
-                if candidate and not re.match(r"^[\d\s,.\-+%€$]+$", candidate):
-                    candidate = re.sub(ISIN_PATTERN, "", candidate).strip()
-                    if len(candidate) > 3:
-                        name = candidate[:60]
-                        break
+    if known:
+        ticker, mapped_name, market, sector = known
+        if not name or len(name) < 3:
+            name = mapped_name
+    else:
+        market = _country_to_market(country)
 
-    # Extract numbers from context
-    shares = _extract_number(context, patterns=[
-        r"(\d+[.,]?\d*)\s*(?:Stk|pcs|shares|parts|Anteile|actions)",
-        r"(?:Stk|Anzahl|Quantity|Nombre)[:\s]*(\d+[.,]?\d*)",
-        r"(\d+[.,]?\d*)\s*(?:x\s)",
-    ])
-
-    avg_cost = _extract_number(context, patterns=[
-        r"(?:Durchschnittskurs|Avg\.?\s*(?:cost|price)|Prix\s*moyen|Kaufkurs)[:\s]*(?:EUR\s*)?(\d+[.,]?\d*)",
-        r"(?:Einstandskurs|Cost\s*basis)[:\s]*(?:EUR\s*)?(\d+[.,]?\d*)",
-    ])
-
-    current_price = _extract_number(context, patterns=[
-        r"(?:Kurs|Price|Cours|Current)[:\s]*(?:EUR\s*)?(\d+[.,]?\d*)",
-        r"(?:Aktueller\s*Kurs)[:\s]*(?:EUR\s*)?(\d+[.,]?\d*)",
-    ])
-
-    value = _extract_number(context, patterns=[
-        r"(?:Wert|Value|Valeur|Gegenwert)[:\s]*(?:EUR\s*)?(\d+[.,]?\d*)",
-        r"EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})",
-    ])
-
-    # If we have value and shares but not avg_cost, estimate
-    if shares and value and not avg_cost and current_price:
-        avg_cost = current_price  # Rough estimate
-
-    if not shares:
-        shares = 0
-    if not avg_cost:
-        avg_cost = current_price or 0
+    asset_type = _guess_asset_type(name, description, sector)
 
     return {
-        "isin": isin,
         "ticker": ticker,
-        "name": name or isin,
+        "name": name,
+        "description": description,
+        "isin": isin,
         "shares": shares,
-        "avg_cost": avg_cost,
-        "current_price": current_price or 0,
-        "value": value or 0,
+        "price_per_share": round(price, 4),
+        "value_eur": round(value, 2),
+        "avg_cost": round(price, 4),
         "market": market,
-        "asset_type": _guess_asset_type(name, isin),
+        "sector": sector.split("-")[-1] if "-" in sector else sector,
+        "asset_type": asset_type,
+        "country": country,
+        "account": account,
     }
 
 
-def _extract_number(text: str, patterns: list[str]) -> float:
-    """Try multiple regex patterns to extract a number."""
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            num_str = match.group(1).replace(",", ".")
-            # Handle European thousands separator
-            parts = num_str.split(".")
-            if len(parts) > 2:
-                # 1.234.56 -> 1234.56
-                num_str = "".join(parts[:-1]) + "." + parts[-1]
-            try:
-                return float(num_str)
-            except ValueError:
-                continue
-    return 0.0
+def _parse_french_number(text: str) -> Optional[float]:
+    """Parse a French-formatted number: 1.234,56 or 264,45."""
+    text = text.strip()
+    if not re.match(r"^-?\d[\d.,]*$", text):
+        return None
+    try:
+        if "," in text:
+            parts = text.split(",")
+            integer_part = parts[0].replace(".", "")
+            decimal_part = parts[1] if len(parts) > 1 else "0"
+            return float(f"{integer_part}.{decimal_part}")
+        else:
+            # Pure integer or already dot-decimal
+            if text.count(".") > 1:
+                return float(text.replace(".", ""))
+            return float(text)
+    except ValueError:
+        return None
 
 
-def _guess_asset_type(name: str, isin: str) -> str:
-    """Guess if position is stock, ETF, or SCPI."""
-    name_lower = (name or "").lower()
-    if any(kw in name_lower for kw in ["etf", "ishares", "vanguard", "lyxor", "amundi", "spdr", "xtrackers"]):
+def _country_to_market(country: str) -> str:
+    """Map French country name to market identifier."""
+    country_lower = (country or "").lower()
+    mapping = {
+        "france": "Paris",
+        "tats-unis": "US",  # "États-Unis" without É
+        "allemagne": "Frankfurt",
+        "pays-bas": "Amsterdam",
+        "irlande": "London",
+        "luxembourg": "Luxembourg",
+        "royaume-uni": "London",
+        "italie": "Milan",
+        "espagne": "Madrid",
+        "afrique du sud": "Johannesburg",
+    }
+    for key, val in mapping.items():
+        if key in country_lower:
+            return val
+    return "US"
+
+
+def _guess_asset_type(name: str, description: str, sector: str) -> str:
+    """Determine asset type from name/description/sector."""
+    combined = f"{name} {description} {sector}".lower()
+    if any(kw in combined for kw in ["etf", "ucits", "ishares", "vanguard", "lyxor",
+                                      "amundi", "spdr", "xtrackers", "vaneck",
+                                      "physical", "open end zt"]):
         return "ETF"
-    if any(kw in name_lower for kw in ["scpi", "opci", "reit", "real estate", "immobilier"]):
+    if any(kw in combined for kw in ["eltif", "nexus", "alternative"]):
+        return "Alternative"
+    if any(kw in combined for kw in ["scpi", "opci", "reit", "immobilier"]):
         return "SCPI"
     return "stock"
 
 
 def parse_tr_csv(file_content: str) -> list[dict]:
-    """
-    Parse a manual CSV export with columns:
-    Ticker,Name,Shares,AvgCost,Market,Sector,AssetType
-    """
+    """Parse a manual CSV. Columns: Ticker,Name,Shares,AvgCost,Market,Sector,AssetType"""
     import csv
     positions = []
     reader = csv.DictReader(io.StringIO(file_content))
-
     for row in reader:
         ticker = (row.get("Ticker") or row.get("ticker") or row.get("Symbol") or "").strip().upper()
         if not ticker:
             continue
-
         positions.append({
             "ticker": ticker,
             "name": row.get("Name") or row.get("name") or ticker,
@@ -220,34 +314,18 @@ def parse_tr_csv(file_content: str) -> list[dict]:
             "sector": row.get("Sector") or row.get("sector") or "",
             "asset_type": row.get("AssetType") or row.get("asset_type") or "stock",
             "isin": row.get("ISIN") or row.get("isin") or "",
+            "account": row.get("Account") or "CTO",
         })
-
     return positions
 
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from PDF using pdfplumber or PyPDF2."""
-    try:
-        import pdfplumber
-        pdf = pdfplumber.open(io.BytesIO(file_bytes))
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-            text += "\n"
-        pdf.close()
-        return text
-    except ImportError:
-        pass
-
-    try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(io.BytesIO(file_bytes))
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-            text += "\n"
-        return text
-    except ImportError:
-        pass
-
-    return ""
+    """Extract text from PDF using pdfplumber."""
+    import pdfplumber
+    pdf = pdfplumber.open(io.BytesIO(file_bytes))
+    text = ""
+    for page in pdf.pages:
+        text += page.extract_text() or ""
+        text += "\n"
+    pdf.close()
+    return text

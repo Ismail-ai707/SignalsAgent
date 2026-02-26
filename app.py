@@ -444,34 +444,52 @@ def page_portfolio(user_id: str):
                 parsed = tri.parse_tr_csv(content)
 
             if parsed:
-                st.success(f"Found {len(parsed)} positions")
+                # Separate by account type
+                accounts = {}
+                for p in parsed:
+                    acct = p.get("account", "CTO")
+                    accounts.setdefault(acct, []).append(p)
 
-                # Preview
+                for acct, acct_positions in accounts.items():
+                    acct_value = sum(p.get("value_eur", 0) for p in acct_positions)
+                    st.markdown(f"**{acct}** — {len(acct_positions)} positions — EUR {acct_value:,.2f}")
+
+                st.success(f"Found {len(parsed)} positions across {len(accounts)} account(s)")
+
+                # Preview table
                 preview_rows = []
                 for p in parsed:
                     preview_rows.append({
+                        "Account": p.get("account", "CTO"),
                         "Ticker": p.get("ticker") or p.get("isin", "?"),
-                        "Name": p["name"][:40],
+                        "Name": p["name"][:35],
+                        "ISIN": p.get("isin", ""),
                         "Shares": p["shares"],
-                        "Avg Cost": p.get("avg_cost", 0),
+                        "Price": p.get("price_per_share", 0),
+                        "Value EUR": p.get("value_eur", 0),
                         "Market": p.get("market", "US"),
                         "Type": p.get("asset_type", "stock"),
+                        "Sector": p.get("sector", ""),
                     })
                 st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-                st.markdown("Edit tickers if needed before importing (some ISINs may not auto-resolve).")
+                st.markdown("Edit tickers below if needed (unmapped ISINs show as empty).")
 
                 # Editable tickers
                 edited = []
                 for i, p in enumerate(parsed):
-                    col1, col2 = st.columns([1, 3])
+                    col1, col2, col3 = st.columns([1, 2, 1])
                     with col1:
                         new_ticker = st.text_input(
                             "Ticker", value=p.get("ticker") or "", key=f"imp_t_{i}",
-                            placeholder="Enter Yahoo ticker"
+                            placeholder="Yahoo ticker"
                         )
                     with col2:
-                        st.markdown(f"{p['name'][:40]} — {p['shares']} shares — {p.get('market', 'US')}")
+                        st.markdown(
+                            f"{p['name'][:35]} — {p['shares']:.4f} sh @ EUR {p.get('price_per_share', 0):.2f}"
+                        )
+                    with col3:
+                        st.markdown(f"{p.get('account', 'CTO')} | {p.get('isin', '')}")
                     edited.append({**p, "ticker": new_ticker or p.get("ticker", "")})
 
                 if st.button("Import All Positions"):
@@ -483,6 +501,8 @@ def page_portfolio(user_id: str):
                                 p["shares"], p.get("avg_cost", 0),
                                 asset_type=p.get("asset_type", "stock"),
                                 market=p.get("market", "US"),
+                                sector=p.get("sector", ""),
+                                notes=f"Account: {p.get('account', 'CTO')} | ISIN: {p.get('isin', '')}",
                             )
                             imported += 1
                     st.success(f"Imported {imported} positions")
